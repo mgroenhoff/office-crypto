@@ -2,15 +2,12 @@ use crate::ole::OleStream;
 use crate::validate;
 use crate::DecryptError::{self, *};
 
-use aes::cipher::{
-    block_padding::NoPadding, generic_array::typenum::consts::U16, generic_array::GenericArray,
-    BlockDecryptMut, KeyInit, KeyIvInit,
-};
+use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyInit, KeyIvInit};
 use base64::engine::general_purpose;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use sha1::Sha1;
-use sha2::{Digest, Sha512};
+use sha2::{digest::DynDigest, Digest, Sha512};
 use std::io::prelude::*;
 use std::io::Cursor;
 
@@ -170,64 +167,64 @@ impl AgileEncryptionInfo {
         key: &[u8],
         encrypted_stream: &OleStream,
     ) -> Result<Vec<u8>, DecryptError> {
-        let total_size = u32::from_le_bytes(
-            encrypted_stream.stream[..4]
+        let total_size = u64::from_le_bytes(
+            encrypted_stream.stream[..8]
                 .try_into()
                 .map_err(|_| InvalidStructure)?,
         ) as usize;
         let mut block_start: usize = 8; // skip first 8 bytes
-        let mut block_index: u32 = 0;
-        let mut decrypted: Vec<u8> = vec![0; total_size];
-        let key_data_salt: &[u8] = &self.key_data_salt;
-
-        match self.key_data_hash_algorithm.as_str() {
-            "SHA512" => {
-                while block_start < (total_size - SEGMENT_LENGTH) {
-                    let iv = Sha512::digest([key_data_salt, &block_index.to_le_bytes()].concat());
-                    let iv = &iv[..16];
-
-                    let cbc_cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
-
-                    // decrypt from encrypted_stream directly to output Vec
-                    cbc_cipher
-                        .decrypt_padded_b2b_mut::<NoPadding>(
-                            &encrypted_stream.stream[block_start..(block_start + SEGMENT_LENGTH)],
-                            &mut decrypted[(block_start - 8)..(block_start - 8 + SEGMENT_LENGTH)],
-                        )
-                        .map_err(|_| InvalidStructure)?;
-
-                    block_index += 1;
-                    block_start += SEGMENT_LENGTH;
-                }
-                // parse last block w less than 4096 bytes
-                let remaining = total_size - (block_start - 8);
-                let iv = Sha512::digest([key_data_salt, &block_index.to_le_bytes()].concat());
-                let iv = &iv[..16];
-
-                let cbc_cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
-                let irregular_block_len = remaining % 16;
-
-                // remaining bytes in encrypted_stream should be a multiple of block size even if we only use some of the decrypted bytes
-                let ciphertext = &encrypted_stream.stream[block_start..];
-                validate!(ciphertext.len() % 16 == 0, InvalidStructure)?;
-
-                let mut plaintext: Vec<u8> = vec![0; ciphertext.len()];
-                cbc_cipher
-                    .decrypt_padded_b2b_mut::<NoPadding>(ciphertext, &mut plaintext)
-                    .map_err(|_| InvalidStructure)?;
-                let mut copy_span = plaintext.len() - 16 + irregular_block_len;
-                if irregular_block_len == 0 {
-                    copy_span += 16;
-                }
-                decrypted[(block_start - 8)..(block_start + copy_span - 8)]
-                    .copy_from_slice(&plaintext[..copy_span]);
-                Ok(decrypted)
+        let mut decrypted: Vec<u8> = vec![0; total_size.next_multiple_of(SEGMENT_LENGTH)];
+        let mut key_data_digest = match self.key_data_hash_algorithm.as_str() {
+            "SHA512" => Sha512::new().box_clone(),
+            "SHA384" => return Err(Unimplemented("SHA384".to_owned())),
+            "SHA256" => return Err(Unimplemented("SHA256".to_owned())),
+            "SHA1" => Sha1::new().box_clone(),
+            key_data_hash_algorithm => {
+                return Err(Unimplemented(key_data_hash_algorithm.to_owned()))
             }
-            "SHA384" => Err(Unimplemented("SHA384".to_owned())),
-            "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
-            _ => Err(InvalidStructure),
+        };
+        let mut iv = vec![0; key_data_digest.output_size()];
+
+        for (block_index, block_data) in (&encrypted_stream.stream[block_start..])
+            .chunks(SEGMENT_LENGTH)
+            .enumerate()
+        {
+            let block_index: u32 = block_index.try_into().unwrap();
+
+            key_data_digest.update(&self.key_data_salt);
+            key_data_digest.update(&block_index.to_le_bytes());
+            key_data_digest.finalize_into_reset(&mut iv).unwrap();
+            let iv = &iv[..self.key_data_block_size as usize];
+
+            let out_buf = &mut decrypted[block_start - 8..block_start - 8 + block_data.len()];
+            match key.len() {
+                16 => {
+                    let cbc_cipher = cbc::Decryptor::<aes::Aes128>::new(key.into(), iv.into());
+                    let decrypted_block = cbc_cipher
+                        .decrypt_padded_b2b_mut::<NoPadding>(block_data, out_buf)
+                        .map_err(|_| InvalidStructure)?;
+                    block_start += decrypted_block.len();
+                }
+                24 => {
+                    let cbc_cipher = cbc::Decryptor::<aes::Aes192>::new(key.into(), iv.into());
+                    let decrypted_block = cbc_cipher
+                        .decrypt_padded_b2b_mut::<NoPadding>(block_data, out_buf)
+                        .map_err(|_| InvalidStructure)?;
+                    block_start += decrypted_block.len();
+                }
+                32 => {
+                    let cbc_cipher = cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into());
+                    let decrypted_block = cbc_cipher
+                        .decrypt_padded_b2b_mut::<NoPadding>(block_data, out_buf)
+                        .map_err(|_| InvalidStructure)?;
+                    block_start += decrypted_block.len();
+                }
+                _ => unimplemented!(),
+            }
         }
+
+        decrypted.truncate(total_size);
+        Ok(decrypted)
     }
 
     // this function is ridiculously expensive as it usually runs 10000 SHA512's
@@ -248,7 +245,14 @@ impl AgileEncryptionInfo {
             }
             "SHA384" => Err(Unimplemented("SHA384".to_owned())),
             "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
+            "SHA1" => {
+                let mut h = Sha1::digest(salted);
+                for i in 0u32..self.spin_count {
+                    h = Sha1::digest([&i.to_le_bytes(), h.as_slice()].concat());
+                }
+
+                Ok(h.as_slice().to_owned())
+            }
             _ => Err(InvalidStructure),
         }
     }
@@ -261,38 +265,47 @@ impl AgileEncryptionInfo {
             }
             "SHA384" => Err(Unimplemented("SHA384".to_owned())),
             "SHA256" => Err(Unimplemented("SHA256".to_owned())),
-            "SHA1" => Err(Unimplemented("SHA1".to_owned())),
+            "SHA1" => {
+                let h = Sha1::digest([digest, block].concat());
+                Ok(h.as_slice()[..(self.password_key_bits as usize / 8)].to_owned())
+            }
             _ => Err(InvalidStructure),
         }
     }
 
     fn decrypt_aes_cbc(&self, key: &[u8]) -> Result<Vec<u8>, DecryptError> {
-        let mut cbc_cipher =
-            cbc::Decryptor::<aes::Aes256>::new(key.into(), self.password_salt.as_slice().into());
-
-        // two 16-byte cbc blocks
-        // TODO how does the hash func affect # of blocks?
-        let i1: GenericArray<u8, U16> =
-            GenericArray::clone_from_slice(&self.encrypted_key_value.clone()[..16]);
-        let i2: GenericArray<u8, U16> =
-            GenericArray::clone_from_slice(&self.encrypted_key_value.clone()[16..]);
-        let ciphertext_blocks = [i1, i2];
-
-        let o1: GenericArray<u8, U16> = GenericArray::default();
-        let o2: GenericArray<u8, U16> = GenericArray::default();
-        let mut plaintext_blocks = [o1, o2];
-
-        cbc_cipher
-            .decrypt_blocks_b2b_mut(&ciphertext_blocks, &mut plaintext_blocks)
-            .map_err(|_| Unknown)?;
-
-        let plaintext = [
-            plaintext_blocks[0].as_slice(),
-            plaintext_blocks[1].as_slice(),
-        ]
-        .concat();
-
-        Ok(plaintext)
+        let mut buf = self.encrypted_key_value.clone();
+        match key.len() {
+            16 => {
+                let cbc_decryptor = cbc::Decryptor::<aes::Aes128>::new(
+                    key.into(),
+                    self.password_salt.as_slice().into(),
+                );
+                cbc_decryptor
+                    .decrypt_padded_mut::<cbc::cipher::block_padding::ZeroPadding>(&mut buf)
+                    .map_err(|_| Unknown)?;
+            }
+            24 => {
+                let cbc_decryptor = cbc::Decryptor::<aes::Aes192>::new(
+                    key.into(),
+                    self.password_salt.as_slice().into(),
+                );
+                cbc_decryptor
+                    .decrypt_padded_mut::<cbc::cipher::block_padding::ZeroPadding>(&mut buf)
+                    .map_err(|_| Unknown)?;
+            }
+            32 => {
+                let cbc_decryptor = cbc::Decryptor::<aes::Aes256>::new(
+                    key.into(),
+                    self.password_salt.as_slice().into(),
+                );
+                cbc_decryptor
+                    .decrypt_padded_mut::<cbc::cipher::block_padding::ZeroPadding>(&mut buf)
+                    .map_err(|_| Unknown)?;
+            }
+            _ => return Err(Unimplemented(format!("CBC AES{}", key.len() * 8))),
+        }
+        Ok(buf)
     }
 }
 
